@@ -45,6 +45,7 @@ NarrowBand Det (the switch above the table; detection runs on the displayed PSD 
   includes the signal's own bins, so the SNR comes out low: by several dB when the signal fills about half of
   it, and for a signal of only a few bins the region is a few bins wide and lies in the window leakage).
   A band that the leakage of a stronger signal explains (sidelobes of the chosen window) is dropped.
+  The threshold (floor + Threshold, dashed) and the floor (dotted) are drawn on the PSD: Display, Detection threshold.
   Signals are tracked by frequency. Present = found in the displayed PSD. Last seen = start time of the last PSD
   window in which the signal was found. Time is counted from samples: t = stream sample / sample rate, with t = 0 at
   the moment the device started the wideband stream at the capture centre (the first sample it delivers; the start-up
@@ -109,8 +110,50 @@ from tkinter import ttk
 
 import numpy as np
 
-import bladerf
-from bladerf import _bladerf
+
+
+def _find_bladerf_dll():
+    """Windows: make bladeRF.dll (and the libusb-1.0.dll next to it) loadable even when the PATH of this shell lacks their
+    folder. Looks in BLADERF_DLL_DIR, in the PATH entries and in Program Files\\bladeRF. Returns the folder or None."""
+    if sys.platform != "win32":
+        return None
+    dirs = [os.environ.get("BLADERF_DLL_DIR", "")] + os.environ.get("PATH", "").split(os.pathsep)
+    for var in ("ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"):
+        base = os.environ.get(var)
+        if base:
+            dirs += [os.path.join(base, "bladeRF", "x64"), os.path.join(base, "bladeRF")]
+    seen = set()
+    for d in dirs:
+        d = d.strip().strip('"')
+        if not d or d.lower() in seen or not os.path.isdir(d):
+            continue
+        seen.add(d.lower())
+        if os.path.isfile(os.path.join(d, "bladeRF.dll")):
+            os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+            try:
+                os.add_dll_directory(d)
+            except (AttributeError, OSError):
+                pass
+            return d
+    return None
+
+
+_BLADERF_DLL_DIR = _find_bladerf_dll()
+try:
+    import bladerf
+    from bladerf import _bladerf
+except OSError as _e:                      # the DLL or one of its own dependencies cannot be loaded
+    _where = _BLADERF_DLL_DIR
+    _lines = [f"ERROR: the bladeRF library cannot be loaded: {_e}"]
+    if _where:
+        _usb = os.path.isfile(os.path.join(_where, "libusb-1.0.dll"))
+        _lines.append(f"bladeRF.dll was found in {_where}; libusb-1.0.dll there: {'yes' if _usb else 'NO (put it next to bladeRF.dll)'}")
+    else:
+        _lines.append("bladeRF.dll was not found in BLADERF_DLL_DIR, in the PATH of this shell or in Program Files\\bladeRF.")
+        _lines.append("Set BLADERF_DLL_DIR to the folder with bladeRF.dll and libusb-1.0.dll, or add it to PATH "
+                      "(where.exe bladeRF.dll shows what Windows finds).")
+    sys.stderr.write("\n".join(_lines) + "\n")
+    sys.exit(2)
 
 # ---------------------------------------------------------------- constants
 
@@ -767,7 +810,8 @@ class NbDetector:
         self.leak_cum = np.concatenate(([0.0], np.cumsum(env ** 2)))   # sum of the leakage power over distances < k
         self.k = np.arange(n, dtype=np.float64)
         self.db_pad = np.empty(n + 1)        # PSD in dB plus a sentinel: reduceat needs indices < length
-        self.floor = np.empty(n)
+        self.floor = np.full(n, np.nan)         # noise floor of the last PSD, dB per bin
+        self.thr_db = np.full(n, np.nan)        # floor + threshold: what a bin must exceed
         self.t1, self.t2 = np.empty(n), np.empty(n)
         self.mask = np.empty(n, bool)
         self.m8 = np.zeros(n + 2, np.int8)
@@ -804,8 +848,8 @@ class NbDetector:
         np.subtract(self.t2, self.t1, out=self.t2)
         self.t2 *= self.wgt
         np.add(self.t1, self.t2, out=self.floor)
-        np.add(self.floor, self.thr, out=self.t1)
-        np.greater(db, self.t1, out=self.mask)
+        np.add(self.floor, self.thr, out=self.thr_db)
+        np.greater(db, self.thr_db, out=self.mask)
         m = self.mask
         if n > 2:                                       # fill single-bin gaps inside a signal
             m[1:-1] |= m[:-2] & m[2:] & ~m[1:-1]
@@ -1953,6 +1997,8 @@ TIPS = {
     "rows": "Waterfall depth in rows. Applies immediately.",
     "range": "Colour range of the waterfall and vertical range of the PSD, dBFS/Hz.",
     "overlay": "Channel bands in RSSI mode, detected signals in NarrowBand Det mode.",
+    "thr": "On the PSD: dashed = the level a bin must exceed to count as a signal (the local noise floor + Threshold),\n"
+           "dotted = the noise floor. The floor is a block median, so it rises under wide signals.",
     "cap_center": "Centre of the band to record, Hz (k/M/G or 428e6). Dragging the overlay changes it.",
     "cap_rate": "Width of the band = output sample rate, Hz: a guide. The nearest rate that a ratio of whole numbers\n"
                 "of the capture rate gives is used, it is shown below. Dragging an edge of the overlay changes it.",
@@ -2006,7 +2052,7 @@ class Tooltip:
 class ScrollFrame(ttk.Frame):
     """Vertically scrollable container; its scrollbar appears only when the content is taller than the view."""
 
-    def __init__(self, parent, width=300):
+    def __init__(self, parent, width=326):
         super().__init__(parent)
         self.canvas = tk.Canvas(self, bg=C["panel"], highlightthickness=0, bd=0, width=width)
         self.sb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
@@ -2441,7 +2487,7 @@ class App:
         for i, (name, unit) in enumerate((a, b)):
             col = 0 if i == 0 else 3
             var = tk.StringVar()
-            e = ttk.Entry(box, textvariable=var, width=9)
+            e = ttk.Entry(box, textvariable=var, width=8)
             e.grid(row=0, column=col, sticky="ew")
             ttk.Label(box, text=unit, style="Muted.TLabel").grid(row=0, column=col + 1, sticky="w", padx=(S1, 0))
             self.vars[name], self.entries[name] = var, e
@@ -2635,6 +2681,7 @@ class App:
         cc.grid(row=2, column=1, columnspan=2, sticky="ew", pady=S1)
         cc.bind("<<ComboboxSelected>>", lambda e: self._display_changed(refocus=True))
         self.auto_range = tk.BooleanVar(value=False)         # a fixed range is the default
+        self.show_thr = tk.BooleanVar(value=True)            # the detection threshold on the PSD
         ar = ttk.Checkbutton(disp, text="Auto range", variable=self.auto_range,
                              command=lambda: (self._range_mode(), self._focus_plots()))
         ar.grid(row=3, column=0, sticky="w", pady=S1)
@@ -2656,8 +2703,12 @@ class App:
                              command=lambda: self._display_changed(refocus=True))
         ov.grid(row=4, column=0, columnspan=3, sticky="w", pady=S1)
         Tooltip(ov, TIPS["overlay"])
+        th = ttk.Checkbutton(disp, text="Detection threshold", variable=self.show_thr,
+                             command=lambda: self._display_changed(refocus=True))
+        th.grid(row=5, column=0, columnspan=3, sticky="w", pady=S1)
+        Tooltip(th, TIPS["thr"])
         rz = ttk.Button(disp, text="Reset zoom", command=self.reset_zoom)
-        rz.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(S2, S1))
+        rz.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(S2, S1))
         Tooltip(rz, TIPS["zoom"])
         self._range_mode()
 
@@ -2708,6 +2759,7 @@ class App:
         self.canvas.mpl_connect("motion_notify_event", self.on_motion)
         self.canvas.mpl_connect("figure_leave_event", self.on_leave)
         self.im = self.psd_line = self.levels = self.cbar = None
+        self.thr_line = self.floor_line = self.thr_text = None
         self.band_pcs = []
         self.hl_patches = []
         self.nb_lcs = []
@@ -2740,10 +2792,17 @@ class App:
         ttk.Button(head, text="Copy", command=self.copy_rssi).pack(side="right")
         body = ttk.Frame(box)
         body.pack(fill="both", expand=True, pady=(S2, 0))
-        self.rssi_text = tk.Text(body, width=RSSI_TEXT_W, wrap="none", bg=C["input"], fg=C["text"], relief="flat",
+        # the column titles sit outside the scrolled text, so they stay in view while the rows scroll
+        self.rssi_head = tk.Text(body, width=RSSI_TEXT_W, height=1, wrap="none", bg=C["input"], fg=C["muted"], relief="flat",
                                  highlightthickness=1, highlightbackground=C["line"], highlightcolor=C["line"],
                                  font=(self.f_mono, 9), padx=S2, pady=S1, state="disabled", cursor="arrow")
-        sb = ttk.Scrollbar(body, orient="vertical", command=self.rssi_text.yview)
+        self.rssi_head.pack(side="top", fill="x")
+        rows = ttk.Frame(body)
+        rows.pack(side="top", fill="both", expand=True)
+        self.rssi_text = tk.Text(rows, width=RSSI_TEXT_W, wrap="none", bg=C["input"], fg=C["text"], relief="flat",
+                                 highlightthickness=1, highlightbackground=C["line"], highlightcolor=C["line"],
+                                 font=(self.f_mono, 9), padx=S2, pady=S1, state="disabled", cursor="arrow")
+        sb = ttk.Scrollbar(rows, orient="vertical", command=self.rssi_text.yview)
         self.rssi_text.configure(yscrollcommand=sb.set)
         self.rssi_text.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
@@ -3022,7 +3081,7 @@ class App:
         v = self.view
         if v is None:
             return
-        row = int(self.rssi_text.index(f"@{event.x},{event.y}").split(".")[0]) - 2      # line 1 is the header
+        row = int(self.rssi_text.index(f"@{event.x},{event.y}").split(".")[0]) - 1      # line 1 is the first row
         if self.mode.get() == "nb":
             if 0 <= row < len(v.nb_order):
                 self._select_signal(int(v.nb_order[row]))
@@ -3660,13 +3719,15 @@ class App:
     # ------------------------------------------------------ display model
 
     def _reset_artists(self):
-        for art in (self.im, self.psd_line, self.levels, *self.band_pcs, *self.hl_patches, *self.nb_lcs, *self.cap_patches):
+        for art in (self.im, self.psd_line, self.levels, self.thr_line, self.floor_line, self.thr_text, *self.band_pcs,
+                    *self.hl_patches, *self.nb_lcs, *self.cap_patches):
             if art is not None:
                 try:
                     art.remove()
                 except (ValueError, NotImplementedError, AttributeError):
                     pass
         self.im = self.psd_line = self.levels = None
+        self.thr_line = self.floor_line = self.thr_text = None
         self.band_pcs, self.hl_patches, self.nb_lcs, self.cap_patches = [], [], [], []
         self.cax.clear()
         self.cax.set_facecolor(C["panel"])
@@ -3736,6 +3797,11 @@ class App:
         self.cbar.ax.tick_params(colors=C["muted"], labelsize=8, length=3)
         self.cbar.outline.set_edgecolor(C["line"])
         (self.psd_line,) = self.ax_psd.plot(fgrid, np.full(n, np.nan), lw=1.0, color=C["psd"], zorder=2)
+        # what the narrowband detector uses: the noise floor (dotted) and floor + threshold (dashed)
+        (self.floor_line,) = self.ax_psd.plot(fgrid, np.full(n, np.nan), lw=0.9, ls=":", color=C["muted"], zorder=2)
+        (self.thr_line,) = self.ax_psd.plot(fgrid, np.full(n, np.nan), lw=1.1, ls=(0, (5, 3)), color=C["ok"], zorder=3)
+        self.thr_text = self.ax_psd.text(0.995, 0.97, "", transform=self.ax_psd.transAxes, ha="right", va="top",
+                                         fontsize=8, color=C["ok"], zorder=6)
         self.ax_wf.set_xlim(v.left, v.right)
         self.ax_psd.set_ylim(-120, -60)
 
@@ -3902,6 +3968,7 @@ class App:
                 self.ax_psd.set_ylim(*self.zoom_y)
         self.im.set_cmap(self._cmap(self.cmap.get()))
         self._detect(p)
+        self._update_threshold()
         if self.mode.get() == "rssi" and len(v.idx):
             v.rssi[:] = v.integ.db(p)
             lvl = v.rssi - v.log_bw
@@ -3910,6 +3977,18 @@ class App:
             self.levels.set_segments(v.segs)
         self._apply_overlay_visibility()
         self._update_highlight()
+
+    def _update_threshold(self):
+        """The detection threshold on the PSD: floor + Threshold (dashed), the floor (dotted). Shown only when the detector
+        works (a bin must fit into Max width) and the check box is on."""
+        v = self.view
+        on = bool(self.show_thr.get() and v.nb.possible)
+        for art in (self.thr_line, self.floor_line, self.thr_text):
+            art.set_visible(on)
+        if on:
+            self.thr_line.set_ydata(v.nb.thr_db)
+            self.floor_line.set_ydata(v.nb.floor)
+            self.thr_text.set_text(f"threshold = floor + {v.nb.thr:g} dB")
 
     def _cmap(self, name):
         import matplotlib
@@ -3925,6 +4004,7 @@ class App:
         top, _ = t.yview()
         t.configure(state="normal")
         t.delete("1.0", "end")
+        self._set_head("")                      # set again below when there are rows
         self._build_rssi_head()
         if self.mode.get() == "nb":
             self._fill_nb(t)
@@ -3934,7 +4014,7 @@ class App:
         elif not len(v.idx):
             t.insert("end", "No channel lies inside the capture band.\nChange the center or the rate.", "empty")
         else:
-            t.insert("end", f"{'Ch':>4} {'Center, MHz':>12} {'Width, MHz':>11} {'RSSI, dBFS':>11}\n", "head")
+            self._set_head(f"{'Ch':>4} {'Center, MHz':>12} {'Width, MHz':>11} {'RSSI, dBFS':>11}")
             lines = []
             for k in range(len(v.idx)):
                 val = v.rssi[k]
@@ -3942,9 +4022,9 @@ class App:
                 lines.append(f"{int(v.idx[k]) + 1:>4} {fmt_freq(v.f_in[k], 3):>12} {fmt_freq(v.bw_in[k], 3):>11} {txt}\n")
             t.insert("end", "".join(lines))
             if self.sel is not None and self.sel[0] == "ch":
-                t.tag_add("selected", f"{self.sel[1] + 2}.0", f"{self.sel[1] + 2}.end")
+                t.tag_add("selected", f"{self.sel[1] + 1}.0", f"{self.sel[1] + 1}.end")
             if self.hover_idx >= 0:
-                line = self.hover_idx + 2
+                line = self.hover_idx + 1
                 t.tag_add("hover", f"{line}.0", f"{line}.end")
         t.yview_moveto(top)
         t.configure(state="disabled")
@@ -3965,8 +4045,8 @@ class App:
             return
         order = vis[np.argsort(tr.center[vis])]
         v.nb_order = order
-        t.insert("end", f"{'Id':>4} {'Center, MHz':>11} {'W, kHz':>7} {'P, dBFS':>8} {'SNR, dB':>7} {'Pres':>4} "
-                        f"{'Seen, s':>9} {'N':>5}\n", "head")
+        self._set_head(f"{'Id':>4} {'Center, MHz':>11} {'W, kHz':>7} {'P, dBFS':>8} {'SNR, dB':>7} {'Pres':>4} "
+                       f"{'Seen, s':>9} {'N':>5}")
         for pos, k in enumerate(order):
             line = (f"{int(tr.ident[k]):>4} {fmt_freq(tr.center[k], 4):>11} {tr.width[k] * 1e-3:7.2f} "
                     f"{tr.power[k]:8.2f} {tr.snr[k]:7.1f} {'yes' if tr.present[k] else 'no':>4} "
@@ -3975,11 +4055,11 @@ class App:
         if self.sel is not None and self.sel[0] == "sig":
             pos = np.flatnonzero(tr.ident[order] == self.sel[1])
             if len(pos):
-                t.tag_add("selected", f"{int(pos[0]) + 2}.0", f"{int(pos[0]) + 2}.end")
+                t.tag_add("selected", f"{int(pos[0]) + 1}.0", f"{int(pos[0]) + 1}.end")
         if self.hover_idx >= 0:
             pos = np.flatnonzero(order == self.hover_idx)
             if len(pos):
-                line = int(pos[0]) + 2
+                line = int(pos[0]) + 1
                 t.tag_add("hover", f"{line}.0", f"{line}.end")
 
     def _detect(self, p):
@@ -4006,6 +4086,7 @@ class App:
         nb = self.mode.get() == "nb"
         self.rssi_box.configure(text="Narrowband signals" if nb else "RSSI per channel")
         self.rssi_text.configure(width=NB_TEXT_W if nb else RSSI_TEXT_W)
+        self.rssi_head.configure(width=NB_TEXT_W if nb else RSSI_TEXT_W)
         self.hover_idx = -1
         self.tip.place_forget()
         self._focus_plots()
@@ -4033,7 +4114,16 @@ class App:
         self.last_draw = 0.0
         self.need_draw = True
 
+    def _set_head(self, text):
+        """The fixed line with the column titles above the rows."""
+        h = self.rssi_head
+        h.configure(state="normal")
+        h.delete("1.0", "end")
+        h.insert("end", text)
+        h.configure(state="disabled")
+
     def _rssi_message(self, text):
+        self._set_head("")
         t = self.rssi_text
         t.configure(state="normal")
         t.delete("1.0", "end")
@@ -4041,7 +4131,9 @@ class App:
         t.configure(state="disabled")
 
     def copy_rssi(self):
-        text = self.rssi_text.get("1.0", "end").strip()
+        head = self.rssi_head.get("1.0", "end").strip("\n")
+        body = self.rssi_text.get("1.0", "end").strip()
+        text = f"{head}\n{body}" if head.strip() else body
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
 
