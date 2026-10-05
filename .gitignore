@@ -1,0 +1,66 @@
+wd/
+capt*/
+
+
+# Python / Byte-compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Віртуальні середовища (Virtual Environments)
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# Пакування та дистрибуція (Distribution / Packaging)
+build*/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Конфігурації та ключі (Environment & Secrets)
+.env
+.env.local
+.env.*.local
+
+# Логи та бази даних
+*.log
+*.sqlite3
+*.db
+
+# Тестування та аналіз (pytest, coverage, mypy, ruff)
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py.cover
+.hypothesis/
+.pytest_cache/
+pytestdebug.txt
+.mypy_cache/
+.pyre/
+.pytype/
+.ruff_cache/
+
+# Jupyter Notebooks
+.ipynb_checkpoints
+
